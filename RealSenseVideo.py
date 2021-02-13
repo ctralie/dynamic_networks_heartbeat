@@ -73,7 +73,7 @@ def getColorsFromMap(u, v, C, mask):
     return c
     
 
-def getFrame(foldername, index, loadColor = True, plotFrame = False):
+def getFrame(foldername, index, loadColor = False, plotFrame = False):
     depthFile = "%s/B-depth-float%i.png"%(foldername, index)
     xyFile = "%s/B-cloud%i.png"%(foldername, index)
     Z = imreadf(depthFile)
@@ -89,7 +89,7 @@ def getFrame(foldername, index, loadColor = True, plotFrame = False):
         uv = imreadf(uvname)
         u = uv[:, 0::2]
         v = uv[:, 1::2]
-        C = scipy.misc.imread("%s/B-color%i.png"%(foldername, index)) / 255.0
+        C = skimage.io.imread("%s/B-color%i.png"%(foldername, index)) / 255.0
         loadedColor = True
     if plotFrame:
         x = X[Z > 0]
@@ -236,12 +236,12 @@ def do0DSublevelsetFiltrationMesh(VPos, ITris, x):
 
 #Comparing real sense to kinect frames
 if __name__ == '__main__':
-    N = 100 # Number of frames to load
-    K = 20 # Number of eigenvectors to use
-    quantile = 0.75
+    N = 5 # Number of frames to load
+    K = 40 # Number of eigenvectors to use
+    quantile = 0.8
 
     v = RealSenseVideo()
-    v.load_video("Chris_Neck", N)
+    v.load_video("Chris_Neck_Color_F200", N)
     
     meshes = []
     ps.init()
@@ -249,7 +249,8 @@ if __name__ == '__main__':
     # First autotune heat time by looking at all eigenvalues
     for i in range(N):
         verts, faces = v.make_mesh_frame(i)
-        L, M = robust_laplacian.mesh_laplacian(verts, faces)
+        #L, M = robust_laplacian.mesh_laplacian(verts, faces)
+        L, M = robust_laplacian.point_cloud_laplacian(verts, mollify_factor=1e-3)
         evals, evecs = sla.eigsh(L, K, M, sigma=1e-8)
         meshes.append({'evals':evals, 'evecs':evecs, 'verts':verts, 'faces':faces})
         if i == 0:
@@ -258,7 +259,7 @@ if __name__ == '__main__':
             allevals = np.concatenate((allevals, evals))
     # Now compute heat kernel signatures and autotune boundary cutoff
     # based on all of them
-    t = 1/np.mean(allevals)
+    t = 10/np.max(allevals)
     allhks = np.array([])
     for i in range(N):
         evals = meshes[i]['evals']
@@ -271,10 +272,12 @@ if __name__ == '__main__':
             allhks = np.concatenate((allhks, hks))
         meshes[i]['hks'] = hks
     c = np.quantile(allhks, quantile)
+    bins = np.linspace(np.min(allhks), c, 50)
 
     # Finally, output result
     plt.figure(figsize=(12, 6))
     all_dgms = []
+    all_hists = []
     min1 = np.inf
     min2 = np.inf
     max1 = -np.inf
@@ -282,6 +285,9 @@ if __name__ == '__main__':
     for i in range(N):
         hks = np.array(meshes[i]['hks'])
         verts, faces = meshes[i]['verts'], meshes[i]['faces']
+        hist = np.histogram(hks[hks <= c], bins)[0]
+        all_hists.append(hist)
+        dd.io.save("all_hists.h5", {"all_hists":all_hists, "bins":bins})
         hks[hks > c] = c
         verts[:, [0, 2]] *= -1 # Flip around
         #ps.register_surface_mesh("Mesh", verts, faces, smooth_shade=True)
@@ -291,13 +297,17 @@ if __name__ == '__main__':
         ps.remove_point_cloud("hks")
         dgmup = do0DSublevelsetFiltrationMesh(verts, faces, hks)
         dgmup = dgmup[np.isfinite(dgmup[:, 1]), :]
-        min1 = min(np.min(dgmup), min1)
-        max1 = max(np.max(dgmup), max1)
+        if dgmup.size > 0:
+            min1 = min(np.min(dgmup), min1)
+            max1 = max(np.max(dgmup), max1)
 
         dgmdown = do0DSublevelsetFiltrationMesh(verts, faces, -hks)
         dgmdown = dgmdown[np.isfinite(dgmdown[:, 1]), :]
-        min2 = min(np.min(dgmdown), min2)
-        max2 = max(np.max(dgmdown), max2)
+        if dgmdown.size > 0:
+            dgmdown = dgmdown[dgmdown[:, 0] > -c, :]
+        if dgmdown.size > 0:
+            min2 = min(np.min(dgmdown), min2)
+            max2 = max(np.max(dgmdown), max2)
 
         all_dgms.append({'dgmup':dgmup, 'dgmdown':dgmdown})
         dd.io.save("all_dgms.h5", {'all_dgms':all_dgms})
@@ -314,12 +324,14 @@ if __name__ == '__main__':
         dgmup, dgmdown = all_dgms[i]['dgmup'], all_dgms[i]['dgmdown']
         plt.clf()
         plt.subplot(121)
-        plot_diagrams(dgmup)
-        plt.xlim([min1, max1])
-        plt.ylim([min1, max1])
+        if dgmup.size > 0:
+            plot_diagrams(dgmup)
+            plt.xlim([min1, max1])
+            plt.ylim([min1, max1])
         plt.subplot(122)
-        plot_diagrams(dgmdown)
-        plt.xlim([min2, max2])
-        plt.ylim([min2, max2])
+        if dgmdown.size > 0:
+            plot_diagrams(dgmdown)
+            plt.xlim([min2, max2])
+            plt.ylim([min2, max2])
         plt.savefig("DGM{}.png".format(i))
 
