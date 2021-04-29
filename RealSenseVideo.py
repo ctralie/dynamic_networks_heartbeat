@@ -15,6 +15,7 @@ from scipy import sparse
 from persim import plot_diagrams
 from sklearn.decomposition import PCA
 import deepdish as dd
+from scipy.spatial import KDTree
 
 def imreadf(filename):
     #Read in file, converting image byte array to little endian float
@@ -220,21 +221,27 @@ def get_edges(VPos, ITris):
     L = sparse.coo_matrix((V, (I, J)), shape=(N, N)).tocsr()
     return L
 
-def get_curvature(VPos, ITris):
+def get_curvature(VPos, ITris, n_neighbs=50):
     # Approximation and eigen decomposition of the shape operator
     # https://github.com/alecjacobson/geometry-processing-curvature
     N = VPos.shape[0]
+    """
     L = get_edges(VPos, ITris)
-    # Get 2-ring neighbors of each vertex
+    # Get 4-ring neighbors of each vertex
     L2 = L.dot(L)
-    L2 = L2.dot(L2)
-    L2 = L2.dot(L2)
+    L3 = L2.dot(L)
+    L4 = L3.dot(L)
+    L = L + L2 + L3 + L4
+    """
+    tree = KDTree(VPos)
+    neighbs = tree.query(VPos, n_neighbs)[1]
+
     curv = np.zeros((N, 2))
     pca = PCA(n_components=3)
     
     for i in range(N):
         try:
-            _, J = L2[i, :].nonzero()
+            J = neighbs[i, :]
             VJ = VPos[J, :]
             VJ -= np.mean(VJ, 0)
             Y = pca.fit_transform(VJ)
@@ -279,7 +286,7 @@ def do0DSublevelsetFiltrationMesh(VPos, ITris, x):
 
 #Comparing real sense to kinect frames
 if __name__ == '__main__':
-    N = 5 # Number of frames to load
+    N = 200 # Number of frames to load
 
     v = RealSenseVideo()
     v.load_video("Chris_Neck_Color_F200", N)
