@@ -13,6 +13,7 @@ import polyscope as ps
 import scipy.sparse.linalg as sla
 from scipy import sparse
 from persim import plot_diagrams
+from sklearn.decomposition import PCA
 import deepdish as dd
 
 def imreadf(filename):
@@ -217,13 +218,53 @@ def get_edges(VPos, ITris):
         I[shift*M*2+M:shift*M*2+2*M] = ITris[:, j]
         J[shift*M*2+M:shift*M*2+2*M] = ITris[:, i] 
     L = sparse.coo_matrix((V, (I, J)), shape=(N, N)).tocsr()
-    return L.nonzero()
+    return L
+
+def get_curvature(VPos, ITris):
+    # Approximation and eigen decomposition of the shape operator
+    # https://github.com/alecjacobson/geometry-processing-curvature
+    N = VPos.shape[0]
+    L = get_edges(VPos, ITris)
+    # Get 2-ring neighbors of each vertex
+    L2 = L.dot(L)
+    L2 = L2.dot(L2)
+    L2 = L2.dot(L2)
+    curv = np.zeros((N, 2))
+    pca = PCA(n_components=3)
+    
+    for i in range(N):
+        try:
+            _, J = L2[i, :].nonzero()
+            VJ = VPos[J, :]
+            VJ -= np.mean(VJ, 0)
+            Y = pca.fit_transform(VJ)
+            u, v, w = Y[:, 0], Y[:, 1], Y[:, 2]
+            A = np.array([u, v, u*u, u*v, v*v]).T
+            AInv = linalg.pinv(A)
+            [a1, a2, a3, a4, a5] = AInv.dot(w)
+            E = 1+a1**2
+            F = a1*a2
+            G = 1+a2**2
+            e = 2*a3/np.sqrt(a1**1+1+a2**2)
+            f = a4/np.sqrt(a1**2+1+a2**2)
+            g = 2*a5/np.sqrt(a1**2+1+a2**2)
+
+            S1 = np.array([[e, f], [f, g]])
+            S2 = np.linalg.inv(np.array([[E, F], [F, G]]))
+            S = -S1.dot(S2)
+            lams = linalg.eig(S)[0]
+            curv[i, :] = lams 
+        except e:
+            print(e)
+    
+    return curv
+        
 
 def do0DSublevelsetFiltrationMesh(VPos, ITris, x):
     from ripser import ripser
     N = VPos.shape[0]
     # Add edges between adjacent points in the mesh    
-    I, J = get_edges(VPos, ITris)
+    I, J = get_edges(VPos, ITris).nonzero()
     V = np.maximum(x[I], x[J])
     # Add vertex birth times along the diagonal of the distance matrix
     I = np.concatenate((I, np.arange(N)))
@@ -234,11 +275,11 @@ def do0DSublevelsetFiltrationMesh(VPos, ITris, x):
     return ripser(D, distance_matrix=True, maxdim=0)['dgms'][0]
 
 
+
+
 #Comparing real sense to kinect frames
 if __name__ == '__main__':
     N = 5 # Number of frames to load
-    K = 40 # Number of eigenvectors to use
-    quantile = 0.8
 
     v = RealSenseVideo()
     v.load_video("Chris_Neck_Color_F200", N)
@@ -247,32 +288,16 @@ if __name__ == '__main__':
     ps.init()
     allevals = np.array([])
     # First autotune heat time by looking at all eigenvalues
+    min_curv = np.inf
+    max_curv = -np.inf
     for i in range(N):
+        print("Processing frame {}".format(i))
         verts, faces = v.make_mesh_frame(i)
-        #L, M = robust_laplacian.mesh_laplacian(verts, faces)
-        L, M = robust_laplacian.point_cloud_laplacian(verts, mollify_factor=1e-3)
-        evals, evecs = sla.eigsh(L, K, M, sigma=1e-8)
-        meshes.append({'evals':evals, 'evecs':evecs, 'verts':verts, 'faces':faces})
-        if i == 0:
-            allevals = evals
-        else:
-            allevals = np.concatenate((allevals, evals))
-    # Now compute heat kernel signatures and autotune boundary cutoff
-    # based on all of them
-    t = 10/np.max(allevals)
-    allhks = np.array([])
-    for i in range(N):
-        evals = meshes[i]['evals']
-        evecs = meshes[i]['evecs']
-        hks = (evecs**2)*np.exp(-evals[None, :]*t)
-        hks = np.sum(hks, 1)
-        if i == 0:
-            allhks = hks
-        else:
-            allhks = np.concatenate((allhks, hks))
-        meshes[i]['hks'] = hks
-    c = np.quantile(allhks, quantile)
-    bins = np.linspace(np.min(allhks), c, 50)
+        curv = get_curvature(verts, faces)
+        min_curv = min(min_curv, np.min(curv))
+        max_curv = max(max_curv, np.max(curv))
+        meshes.append({'verts':verts, 'faces':faces, 'curv':curv})
+    bins = np.linspace(min_curv, max_curv, 50)
 
     # Finally, output result
     plt.figure(figsize=(12, 6))
@@ -283,28 +308,25 @@ if __name__ == '__main__':
     max1 = -np.inf
     max2 = -np.inf
     for i in range(N):
-        hks = np.array(meshes[i]['hks'])
-        verts, faces = meshes[i]['verts'], meshes[i]['faces']
-        hist = np.histogram(hks[hks <= c], bins)[0]
+        verts, faces, curv = meshes[i]['verts'], meshes[i]['faces'], meshes[i]['curv']
+        curv = curv[:, 0]*curv[:, 1]
+        hist = np.histogram(curv, bins)[0]
         all_hists.append(hist)
         dd.io.save("all_hists.h5", {"all_hists":all_hists, "bins":bins})
-        hks[hks > c] = c
         verts[:, [0, 2]] *= -1 # Flip around
         #ps.register_surface_mesh("Mesh", verts, faces, smooth_shade=True)
-        ps_cloud = ps.register_point_cloud("hks", verts)
-        ps_cloud.add_scalar_quantity("hks", hks, enabled=True)
-        ps.screenshot("{}_{}_{}.png".format(K, quantile, i))
-        ps.remove_point_cloud("hks")
-        dgmup = do0DSublevelsetFiltrationMesh(verts, faces, hks)
+        ps_cloud = ps.register_point_cloud("curv", verts)
+        ps_cloud.add_scalar_quantity("curv", curv, enabled=True)
+        ps.screenshot("{}.png".format(i))
+        ps.remove_point_cloud("curv")
+        dgmup = do0DSublevelsetFiltrationMesh(verts, faces, curv)
         dgmup = dgmup[np.isfinite(dgmup[:, 1]), :]
         if dgmup.size > 0:
             min1 = min(np.min(dgmup), min1)
             max1 = max(np.max(dgmup), max1)
 
-        dgmdown = do0DSublevelsetFiltrationMesh(verts, faces, -hks)
+        dgmdown = do0DSublevelsetFiltrationMesh(verts, faces, -curv)
         dgmdown = dgmdown[np.isfinite(dgmdown[:, 1]), :]
-        if dgmdown.size > 0:
-            dgmdown = dgmdown[dgmdown[:, 0] > -c, :]
         if dgmdown.size > 0:
             min2 = min(np.min(dgmdown), min2)
             max2 = max(np.max(dgmdown), max2)
